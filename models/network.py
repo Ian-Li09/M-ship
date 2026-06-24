@@ -1,0 +1,454 @@
+import math
+import torch
+from inspect import isfunction
+from functools import partial
+import numpy as np
+from tqdm import tqdm
+from core.base_network import BaseNetwork
+import torch.nn as nn
+class Network(BaseNetwork):
+    def __init__(self, unet, beta_schedule, module_name='sr3', **kwargs):
+        super(Network, self).__init__(**kwargs)
+        if module_name == 'sr3':
+            from .sr3_modules.unet import UNet
+        elif module_name == 'guided_diffusion':
+            from .guided_diffusion_modules.unet import UNet
+        
+        self.denoise_fn = UNet(**unet)
+        self.beta_schedule = beta_schedule
+
+    def set_loss(self, loss_fn):
+        self.loss_fn = loss_fn
+
+    def set_new_noise_schedule(self, device=torch.device('cuda'), phase='train'):
+        to_torch = partial(torch.tensor, dtype=torch.float32, device=device)
+        betas = make_beta_schedule(**self.beta_schedule[phase])
+        betas = betas.detach().cpu().numpy() if isinstance(
+            betas, torch.Tensor) else betas
+        alphas = 1. - betas
+
+        timesteps, = betas.shape
+        self.num_timesteps = int(timesteps)
+        
+        gammas = np.cumprod(alphas, axis=0)
+        gammas_prev = np.append(1., gammas[:-1])
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+        self.register_buffer('gammas', to_torch(gammas))
+        self.register_buffer('sqrt_recip_gammas', to_torch(np.sqrt(1. / gammas)))
+        self.register_buffer('sqrt_recipm1_gammas', to_torch(np.sqrt(1. / gammas - 1)))
+
+        # calculations for posterior q(x_{t-1} | x_t, x_0)
+        posterior_variance = betas * (1. - gammas_prev) / (1. - gammas)
+        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
+        self.register_buffer('posterior_log_variance_clipped', to_torch(np.log(np.maximum(posterior_variance, 1e-20))))
+        self.register_buffer('posterior_mean_coef1', to_torch(betas * np.sqrt(gammas_prev) / (1. - gammas)))
+        self.register_buffer('posterior_mean_coef2', to_torch((1. - gammas_prev) * np.sqrt(alphas) / (1. - gammas)))
+
+    def predict_start_from_noise(self, y_t, t, noise):
+        return (
+            extract(self.sqrt_recip_gammas, t, y_t.shape) * y_t -
+            extract(self.sqrt_recipm1_gammas, t, y_t.shape) * noise
+        )
+
+    def q_posterior(self, y_0_hat, y_t, t):
+        posterior_mean = (
+            extract(self.posterior_mean_coef1, t, y_t.shape) * y_0_hat +
+            extract(self.posterior_mean_coef2, t, y_t.shape) * y_t
+        )
+        posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, y_t.shape)
+        return posterior_mean, posterior_log_variance_clipped
+
+    def p_mean_variance(self, y_t, t, clip_denoised: bool, y_cond=None):
+        #import pdb;pdb.set_trace()
+        noise_level = extract(self.gammas, t, x_shape=(1, 1)).to(y_t.device)
+        y_0_hat = self.predict_start_from_noise(
+                y_t, t=t, noise=self.denoise_fn(torch.cat([y_cond, y_t], dim=1), noise_level))
+
+        if clip_denoised:
+            y_0_hat.clamp_(-1., 1.)
+
+        model_mean, posterior_log_variance = self.q_posterior(
+            y_0_hat=y_0_hat, y_t=y_t, t=t)
+        return model_mean, posterior_log_variance
+
+    def q_sample(self, y_0, sample_gammas, noise=None):
+        noise = default(noise, lambda: torch.randn_like(y_0))
+        return (
+            sample_gammas.sqrt() * y_0 +
+            (1 - sample_gammas).sqrt() * noise
+        )
+
+    @torch.no_grad()
+    def p_sample(self, y_t, t, clip_denoised=True, y_cond=None):
+        model_mean, model_log_variance = self.p_mean_variance(
+            y_t=y_t, t=t, clip_denoised=clip_denoised, y_cond=y_cond)
+        noise = torch.randn_like(y_t) if any(t>0) else torch.zeros_like(y_t)
+        return model_mean + noise * (0.5 * model_log_variance).exp()
+
+    @torch.no_grad()
+    def restoration(self, y_cond, y_t=None, y_0=None, mask=None, sample_num=8):
+        b, *_ = y_cond.shape
+
+        assert self.num_timesteps > sample_num, 'num_timesteps must greater than sample_num'
+        sample_inter = (self.num_timesteps//sample_num)
+        
+        y_t = default(y_t, lambda: torch.randn_like(y_cond))
+        ret_arr = y_t
+        #import pdb;pdb.set_trace()
+        for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
+            t = torch.full((b,), i, device=y_cond.device, dtype=torch.long)
+            y_t = self.p_sample(y_t, t, y_cond=y_cond)
+            if mask is not None:
+                y_t = y_0*(1.-mask) + mask*y_t
+            if i % sample_inter == 0:
+                ret_arr = torch.cat([ret_arr, y_t], dim=0)
+        return y_t, ret_arr
+
+    def forward(self, y_0, y_cond=None, mask=None, noise=None):
+        # sampling from p(gammas)
+        #import pdb;pdb.set_trace()
+
+
+        b, *_ = y_0.shape
+        t = torch.randint(1, self.num_timesteps, (b,), device=y_0.device).long()
+        gamma_t1 = extract(self.gammas, t-1, x_shape=(1, 1))
+        sqrt_gamma_t2 = extract(self.gammas, t, x_shape=(1, 1))
+        sample_gammas = (sqrt_gamma_t2-gamma_t1) * torch.rand((b, 1), device=y_0.device) + gamma_t1
+        sample_gammas = sample_gammas.view(b, -1)
+
+        noise = default(noise, lambda: torch.randn_like(y_0))
+        y_noisy = self.q_sample(
+            y_0=y_0, sample_gammas=sample_gammas.view(-1, 1, 1, 1), noise=noise)
+
+        if mask is not None:
+            noise_hat = self.denoise_fn(torch.cat([y_cond, y_noisy*mask+(1.-mask)*y_0], dim=1), sample_gammas)
+            loss = self.loss_fn(mask*noise, mask*noise_hat)
+        else:
+            noise_hat = self.denoise_fn(torch.cat([y_cond, y_noisy], dim=1), sample_gammas)
+            loss = self.loss_fn(noise, noise_hat)
+        return loss
+
+
+
+
+class BCDif(BaseNetwork):
+    def __init__(self, unet, beta_schedule, module_name='sr3', **kwargs):
+        super(BCDif, self).__init__(**kwargs)
+        if module_name == 'sr3':
+            from .sr3_modules.unet import UNet
+        elif module_name == 'guided_diffusion':
+            from .guided_diffusion_modules.unet import UNet
+        
+        self.denoise_fn = UNet(**unet)
+        self.beta_schedule = beta_schedule
+        #import pdb;pdb.set_trace()
+        #self.set_condition(image_size,image_size, num_env)
+        
+
+    def set_loss(self, loss_fn):
+        self.loss_fn = loss_fn
+
+    def set_condition(self, h_size,w_size, num_env, device=torch.device('cuda')):
+        to_torch = partial(torch.tensor, dtype=torch.float32, device=device)
+        #class_condition = np.randn(num_class, h_size, w_size) #c,h,w
+        env_condition = np.random.randn(num_env, 1, h_size, w_size)
+
+        #self.register_parameter('class_condition',nn.Parameter(to_torch(class_condition)))
+        self.register_parameter('env_condition',nn.Parameter(to_torch(env_condition)))
+
+    def set_new_noise_schedule(self, device=torch.device('cuda'), phase='train'):
+        to_torch = partial(torch.tensor, dtype=torch.float32, device=device)
+        betas = make_beta_schedule(**self.beta_schedule[phase])
+        betas = betas.detach().cpu().numpy() if isinstance(
+            betas, torch.Tensor) else betas
+        alphas = 1. - betas
+
+        timesteps, = betas.shape
+        self.num_timesteps = int(timesteps)
+        
+        gammas = np.cumprod(alphas, axis=0)
+        gammas_prev = np.append(1., gammas[:-1])
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+        self.register_buffer('gammas', to_torch(gammas))
+        self.register_buffer('sqrt_recip_gammas', to_torch(np.sqrt(1. / gammas)))
+        self.register_buffer('sqrt_recipm1_gammas', to_torch(np.sqrt(1. / gammas - 1)))
+
+        # calculations for posterior q(x_{t-1} | x_t, x_0)
+        posterior_variance = betas * (1. - gammas_prev) / (1. - gammas)
+        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
+        self.register_buffer('posterior_log_variance_clipped', to_torch(np.log(np.maximum(posterior_variance, 1e-20))))
+        self.register_buffer('posterior_mean_coef1', to_torch(betas * np.sqrt(gammas_prev) / (1. - gammas)))
+        self.register_buffer('posterior_mean_coef2', to_torch((1. - gammas_prev) * np.sqrt(alphas) / (1. - gammas)))
+
+    def predict_start_from_noise(self, y_t, t, noise):
+        return (
+            extract(self.sqrt_recip_gammas, t, y_t.shape) * y_t -
+            extract(self.sqrt_recipm1_gammas, t, y_t.shape) * noise
+        )
+
+    def q_posterior(self, y_0_hat, y_t, t):
+        posterior_mean = (
+            extract(self.posterior_mean_coef1, t, y_t.shape) * y_0_hat +
+            extract(self.posterior_mean_coef2, t, y_t.shape) * y_t
+        )
+        posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, y_t.shape)
+        return posterior_mean, posterior_log_variance_clipped
+
+    @torch.no_grad()
+    def _build_vertical_split_env(self, mask, env_up, env_down):
+        """
+        用 mask 的纵向中点 (min_y+max_y)/2 做硬分割：
+            上方 → env_up, 下方 → env_down
+        返回预计算的 cond_env (B, C, H, W)。
+        """
+        b, _, h, w = mask.shape
+        device = mask.device
+
+        # 找 mask 非零区域的行索引
+        mask_flat = mask.view(b, h, w)  # (B, H, W)
+        # 对每个样本，找最高行和最低行
+        y_indices = torch.arange(h, device=device).view(1, h, 1)
+        mask_present = mask_float = mask_flat.float()
+        # 每样本有效行的最小/最大索引
+        has_mask = mask_present.sum(dim=(1, 2)) > 0  # (B,)
+        y_min = torch.where(has_mask,
+            (y_indices * mask_float).masked_fill(mask_float == 0, h).amin(dim=(1, 2)),
+            torch.full((b,), 0.0, device=device))
+        y_max = torch.where(has_mask,
+            (y_indices * mask_float).amax(dim=(1, 2)),
+            torch.full((b,), float(h - 1), device=device))
+        cy = (y_min + y_max) / 2.0
+
+        # 硬分割权重
+        rows = torch.arange(h, device=device, dtype=mask.dtype).view(1, 1, h, 1)
+        w_top = (rows < cy.view(b, 1, 1, 1)).float()
+        w_bot = 1.0 - w_top
+
+        cond_env = (w_top * self.env_condition[env_up] +
+                    w_bot * self.env_condition[env_down])
+        return cond_env
+
+    def p_mean_variance(self, y_t, t, clip_denoised: bool, y_cond=None, image_env=None, cond_env=None):
+        #import pdb;pdb.set_trace()
+        noise_level = extract(self.gammas, t, x_shape=(1, 1)).to(y_t.device)
+
+        # if cond_env is None:
+        #     cond_env = self.env_condition[image_env]
+
+        y_0_hat = self.predict_start_from_noise(
+                y_t, t=t, noise=self.denoise_fn(torch.cat([y_cond, y_t, cond_env], dim=1), noise_level))
+
+        if clip_denoised:
+            y_0_hat.clamp_(-1., 1.)
+
+        model_mean, posterior_log_variance = self.q_posterior(
+            y_0_hat=y_0_hat, y_t=y_t, t=t)
+        return model_mean, posterior_log_variance
+
+    def q_sample(self, y_0, sample_gammas, noise=None):
+        noise = default(noise, lambda: torch.randn_like(y_0))
+        return (
+            sample_gammas.sqrt() * y_0 +
+            (1 - sample_gammas).sqrt() * noise
+        )
+
+    @torch.no_grad()
+    def p_sample(self, y_t, t, clip_denoised=True, y_cond=None, image_env=None, cond_env=None):
+        model_mean, model_log_variance = self.p_mean_variance(
+            y_t=y_t, t=t, clip_denoised=clip_denoised, y_cond=y_cond, image_env=image_env, cond_env=cond_env)
+        noise = torch.randn_like(y_t) if any(t>0) else torch.zeros_like(y_t)
+        return model_mean + noise * (0.5 * model_log_variance).exp()
+    """
+        DDIM ACCELERATED GENERATION PROCESSES
+    """
+    @torch.no_grad()
+    def ddim_step(self, y_t, t, t_prev, clip_denoised=True, y_cond=None, image_env=None, cond_env=None, eta=0.0):
+        # one step sample of DDIM
+        b, c, h, w = y_t.shape
+        if cond_env is None:
+            cond_env = self.env_condition[image_env]
+
+        noise_pred = self.denoise_fn(
+            torch.cat([y_cond, y_t, cond_env], dim=1),
+            extract(self.gammas, t, x_shape=(1, 1)))
+
+        alpha_bar_t = extract(self.gammas, t, x_shape=y_t.shape)
+
+        # alpha_bar of t_prev: for t_prev=-1 (final step), alpha_bar = 1.0
+        # Avoid gather(-1) which triggers CUDA assertion on some devices
+        is_final = (t_prev < 0).view(b, 1, 1, 1)
+        t_prev_safe = torch.where(t_prev < 0, torch.zeros_like(t_prev), t_prev)
+        alpha_bar_t_prev = extract(self.gammas, t_prev_safe, x_shape=y_t.shape)
+        alpha_bar_t_prev = torch.where(is_final, torch.ones_like(alpha_bar_t_prev), alpha_bar_t_prev)
+
+        pred_x_0 = self.predict_start_from_noise(y_t, t, noise_pred)
+        if clip_denoised:
+            pred_x_0.clamp_(-1., 1.)
+
+        sigma = eta * torch.sqrt((1 - alpha_bar_t_prev) / (1 - alpha_bar_t + 1e-10)) * \
+                torch.sqrt((1 - alpha_bar_t / (alpha_bar_t_prev + 1e-10)).clamp(min=0))
+
+        pred_dir = torch.sqrt((1 - alpha_bar_t_prev - sigma ** 2).clamp(min=1e-10)) * noise_pred
+        noise = torch.randn_like(y_t) if eta > 0 else torch.zeros_like(y_t)
+        y_t_prev = torch.sqrt(alpha_bar_t_prev) * pred_x_0 + pred_dir + sigma * noise
+        return y_t_prev
+
+    @torch.no_grad()
+    def ddim_restoration(self, y_cond, y_t=None, y_0=None, mask=None, sample_num=8, image_env=None,
+                         ddim_steps=200, eta=0.2, spacing='trailing'):
+        b, *_ = y_cond.shape
+
+        assert self.num_timesteps >= ddim_steps, 'num_timesteps must >= ddim_steps'
+        assert ddim_steps >= sample_num, 'ddim_steps must >= sample_num'
+
+        # 单次采样模式：image_env=(env_up, env_down) → 空间混合 cond_env
+        cond_env = None
+        if isinstance(image_env, (tuple, list)) and len(image_env) == 2 and mask is not None:
+            cond_env = self._build_vertical_split_env(mask, image_env[0], image_env[1])
+            image_env = None
+
+        if spacing == 'trailing':
+            frac = np.linspace(0, 1, ddim_steps) ** 3
+        elif spacing == 'leading':
+            frac = np.linspace(0, 1, ddim_steps) ** (1. / 3)
+        else:
+            frac = np.linspace(0, 1, ddim_steps)
+
+        timesteps = ((1 - frac) * (self.num_timesteps - 1)).astype(int)
+        timesteps = np.unique(timesteps)[::-1].tolist()
+        timesteps[-1] = 0
+        sample_inter = max(len(timesteps) // sample_num, 1)
+
+        y_t = default(y_t, lambda: torch.randn_like(y_cond))
+        ret_arr = y_t
+
+        for idx, i in enumerate(tqdm(timesteps, desc='ddim sampling loop', total=len(timesteps))):
+            t = torch.full((b,), i, device=y_cond.device, dtype=torch.long)
+            t_prev_idx = idx + 1
+            if t_prev_idx < len(timesteps):
+                t_prev = torch.full((b,), timesteps[t_prev_idx], device=y_cond.device, dtype=torch.long)
+            else:
+                t_prev = torch.full((b,), -1, device=y_cond.device, dtype=torch.long)
+
+            y_t = self.ddim_step(y_t, t, t_prev, y_cond=y_cond, cond_env=cond_env, image_env=image_env, eta=eta)
+            if mask is not None:
+                y_t = y_0 * (1. - mask) + mask * y_t
+            if idx % sample_inter == 0:
+                ret_arr = torch.cat([ret_arr, y_t], dim=0)
+        return y_t, ret_arr
+
+    @torch.no_grad()
+    def restoration(self, y_cond, y_t=None, y_0=None, mask=None, sample_num=8, image_env=None,
+                    use_ddim=True, ddim_steps=100, eta=0.5, spacing='trailing'):
+        if use_ddim:
+            return self.ddim_restoration(y_cond, y_t=y_t, y_0=y_0, mask=mask,
+                                         sample_num=sample_num, image_env=image_env,
+                                         ddim_steps=ddim_steps, eta=eta, spacing=spacing)
+
+        b, *_ = y_cond.shape
+
+        assert self.num_timesteps > sample_num, 'num_timesteps must greater than sample_num'
+        sample_inter = (self.num_timesteps//sample_num)
+
+        # 单次采样模式：image_env=(env_up, env_down) → 空间混合 cond_env
+        cond_env = None
+        if isinstance(image_env, (tuple, list)) and len(image_env) == 2 and mask is not None:
+            cond_env = self._build_vertical_split_env(mask, image_env[0], image_env[1])
+            image_env = None
+
+        y_t = default(y_t, lambda: torch.randn_like(y_cond))
+        ret_arr = y_t
+        for i in tqdm(reversed(range(0, self.num_timesteps)), desc='ddpm sampling loop time step', total=self.num_timesteps):
+            t = torch.full((b,), i, device=y_cond.device, dtype=torch.long)
+            y_t = self.p_sample(y_t, t, y_cond=y_cond, cond_env=cond_env, image_env=image_env)
+            if mask is not None:
+                y_t = y_0*(1.-mask) + mask*y_t
+            if i % sample_inter == 0:
+                ret_arr = torch.cat([ret_arr, y_t], dim=0)
+        return y_t, ret_arr
+
+    def forward(self, y_0, y_cond=None, mask=None, image_env = None,noise=None):
+        # sampling from p(gammas)
+        #import pdb;pdb.set_trace()
+
+        #print(self.env_condition)
+
+        b, *_ = y_0.shape
+        t = torch.randint(1, self.num_timesteps, (b,), device=y_0.device).long()
+        gamma_t1 = extract(self.gammas, t-1, x_shape=(1, 1))
+        sqrt_gamma_t2 = extract(self.gammas, t, x_shape=(1, 1))
+        sample_gammas = (sqrt_gamma_t2-gamma_t1) * torch.rand((b, 1), device=y_0.device) + gamma_t1
+        sample_gammas = sample_gammas.view(b, -1)
+
+        noise = default(noise, lambda: torch.randn_like(y_0))
+        y_noisy = self.q_sample(
+            y_0=y_0, sample_gammas=sample_gammas.view(-1, 1, 1, 1), noise=noise)
+
+        #import pdb;pdb.set_trace()
+        cond_env = self.env_condition[image_env]
+
+        if mask is not None:
+            #noise_hat = self.denoise_fn(torch.cat([y_cond, y_noisy*mask+(1.-mask)*y_0], dim=1), sample_gammas)
+            noise_hat = self.denoise_fn(torch.cat([y_cond, y_noisy*mask+(1.-mask)*y_0, cond_env], dim=1), sample_gammas)
+            loss = self.loss_fn(mask*noise, mask*noise_hat)
+        else:
+            noise_hat = self.denoise_fn(torch.cat([y_cond, y_noisy], dim=1), sample_gammas)
+            loss = self.loss_fn(noise, noise_hat)
+        return loss
+
+# gaussian diffusion trainer class
+def exists(x):
+    return x is not None
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
+
+def extract(a, t, x_shape=(1,1,1,1)):
+    #import pdb;pdb.set_trace()
+    b, *_ = t.shape
+    out = a.gather(-1, t)
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
+# beta_schedule function
+def _warmup_beta(linear_start, linear_end, n_timestep, warmup_frac):
+    betas = linear_end * np.ones(n_timestep, dtype=np.float64)
+    warmup_time = int(n_timestep * warmup_frac)
+    betas[:warmup_time] = np.linspace(
+        linear_start, linear_end, warmup_time, dtype=np.float64)
+    return betas
+
+def make_beta_schedule(schedule, n_timestep, linear_start=1e-6, linear_end=1e-2, cosine_s=8e-3):
+    if schedule == 'quad':
+        betas = np.linspace(linear_start ** 0.5, linear_end ** 0.5,
+                            n_timestep, dtype=np.float64) ** 2
+    elif schedule == 'linear':
+        betas = np.linspace(linear_start, linear_end,
+                            n_timestep, dtype=np.float64)
+    elif schedule == 'warmup10':
+        betas = _warmup_beta(linear_start, linear_end,
+                             n_timestep, 0.1)
+    elif schedule == 'warmup50':
+        betas = _warmup_beta(linear_start, linear_end,
+                             n_timestep, 0.5)
+    elif schedule == 'const':
+        betas = linear_end * np.ones(n_timestep, dtype=np.float64)
+    elif schedule == 'jsd':  # 1/T, 1/(T-1), 1/(T-2), ..., 1
+        betas = 1. / np.linspace(n_timestep,
+                                 1, n_timestep, dtype=np.float64)
+    elif schedule == "cosine":
+        timesteps = (
+            torch.arange(n_timestep + 1, dtype=torch.float64) /
+            n_timestep + cosine_s
+        )
+        alphas = timesteps / (1 + cosine_s) * math.pi / 2
+        alphas = torch.cos(alphas).pow(2)
+        alphas = alphas / alphas[0]
+        betas = 1 - alphas[1:] / alphas[:-1]
+        betas = betas.clamp(max=0.999)
+    else:
+        raise NotImplementedError(schedule)
+    return betas
